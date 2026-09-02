@@ -1866,11 +1866,11 @@ tile_z = st.sidebar.select_slider(
 tile_yx = st.sidebar.select_slider(
     "XY tile数",
     options=[1, 2, 3, 4],
-    value=1,
+    value=2,
 )
 
 st.sidebar.caption(
-    "まず2×1×1から開始し、MemoryError時だけ自動的に細かいtilingへ切り替えます。"
+    "まず2×2×2から開始し、MemoryError時だけ自動的に細かいtilingへ切り替えます。"
 )
 
 
@@ -1950,7 +1950,7 @@ st.header("② 核候補を高速検出")
 
 detect_button = st.button(
     "🔎 核候補ROIを検出",
-    use_container_width=True,
+    width="stretch",
 )
 
 if detect_button or st.session_state.candidates is None:
@@ -2002,7 +2002,7 @@ fig_candidates = make_candidate_figure(
 
 st.pyplot(
     fig_candidates,
-    use_container_width=True,
+    width="stretch",
 )
 
 import matplotlib.pyplot as plt
@@ -2047,7 +2047,7 @@ candidate_df = pd.DataFrame(candidate_rows)
 
 st.dataframe(
     candidate_df,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
@@ -2175,7 +2175,7 @@ st.info(
 run_button = st.button(
     "🧠 選択したROIだけ3D核を認識して体積計算",
     type="primary",
-    use_container_width=True,
+    width="stretch",
     disabled=(len(selected_candidates) == 0),
 )
 
@@ -2309,7 +2309,7 @@ if results is None or results.empty:
     if diag_rows:
         st.dataframe(
             pd.DataFrame(diag_rows),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
 
@@ -2367,7 +2367,7 @@ st.dataframe(
             "Inference time (s)",
         ]
     ],
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
@@ -2413,7 +2413,7 @@ if selected_record is not None:
     )
     st.pyplot(
         fig_mip_overlay,
-        use_container_width=True,
+        width="stretch",
     )
     plt.close(fig_mip_overlay)
 
@@ -2451,7 +2451,7 @@ if selected_record is not None:
 
     st.pyplot(
         fig_overlay,
-        use_container_width=True,
+        width="stretch",
     )
 
     plt.close(fig_overlay)
@@ -2485,7 +2485,7 @@ if show_3d and selected_record is not None:
 
     st.plotly_chart(
         fig3d,
-        use_container_width=True,
+        width="stretch",
     )
 
 else:
@@ -2560,7 +2560,7 @@ st.header("⑩ 最終結果")
 
 st.dataframe(
     final_df,
-    use_container_width=True,
+    width="stretch",
     hide_index=True,
 )
 
