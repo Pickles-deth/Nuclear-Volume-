@@ -1,0 +1,11 @@
+streamlit
+numpy
+pandas
+tifffile
+plotly
+scipy
+scikit-image
+matplotlib
+tensorflow
+stardist
+csbdeep
