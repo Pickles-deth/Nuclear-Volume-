@@ -1,0 +1,2021 @@
+import os
+import re
+
+import numpy as np
+import pandas as pd
+import tifffile
+
+from scipy import ndimage as ndi
+from skimage import filters, morphology, measure
+
+from qtpy.QtCore import Qt, QSignalBlocker
+from qtpy.QtWidgets import (
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QFileDialog,
+    QSlider,
+    QSpinBox,
+    QDoubleSpinBox,
+    QPlainTextEdit,
+    QComboBox,
+    QGroupBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QHeaderView,
+    QAbstractItemView,
+    QScrollArea,
+    QProgressBar,
+    QApplication,
+)
+
+# ============================================================
+# Fixed standardized protocol
+# ============================================================
+PROTOCOL_NAME = "Standardized Auto Nuclear Volume"
+PROTOCOL_VERSION = "1.0"
+
+# These values are intentionally fixed for fair comparison.
+NORM_LOW_PERCENTILE = 1.0
+NORM_HIGH_PERCENTILE = 99.8
+GAUSSIAN_SIGMA = 1.0
+CLOSING_RADIUS = 1
+CONNECTIVITY = 1
+
+
+def natural_key(text):
+    return [
+        int(c) if c.isdigit() else c.lower()
+        for c in re.split(r"(\d+)", text)
+    ]
+
+
+class NuclearVolumeWidget(QWidget):
+    def __init__(self, napari_viewer):
+        super().__init__()
+
+        self.viewer = napari_viewer
+
+        self.stack = None
+        self.normalized_stack = None
+        self.smoothed_stack = None
+
+        self.image_layer = None
+        self.mask_layer = None
+        self.nuclei_layer = None
+        self.number_layer = None
+        self.selected_nucleus_layer = None
+
+        self.labels = None
+        self.results_df = None
+
+        self.auto_threshold_norm = None
+        self.auto_threshold_raw_equiv = None
+        self.norm_low_value = None
+        self.norm_high_value = None
+        self.background_value = None
+        self.analysis_mode_used = None
+
+        # UI stability only. These variables do NOT change the analysis
+        # algorithm or any numerical parameter.
+        self._busy = False
+        self._busy_mode_index = None
+
+        # Outer layout stays fixed in the napari dock.
+        # All controls live inside a vertically scrollable area.
+        outer_layout = QVBoxLayout()
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded
+        )
+        self.scroll_area.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded
+        )
+
+        scroll_content = QWidget()
+        main_layout = QVBoxLayout()
+        scroll_content.setLayout(main_layout)
+
+        # ==================================================
+        # Title
+        # ==================================================
+        title = QLabel("Nuclear Volume Analyzer")
+        title.setStyleSheet(
+            "font-size: 18px; font-weight: bold;"
+        )
+        main_layout.addWidget(title)
+
+        subtitle = QLabel(
+            "Standardized Auto mode applies the same analysis rule "
+            "to every sample, even when fluorescence intensity differs."
+        )
+        subtitle.setWordWrap(True)
+        main_layout.addWidget(subtitle)
+
+        # ==================================================
+        # 1. Folder
+        # ==================================================
+        step1 = QLabel("1. Load Z-stack")
+        step1.setStyleSheet(
+            "font-weight: bold; margin-top: 10px;"
+        )
+        main_layout.addWidget(step1)
+
+        self.folder_label = QLabel("No folder selected")
+        self.folder_label.setWordWrap(True)
+        main_layout.addWidget(self.folder_label)
+
+        self.open_button = QPushButton(
+            "Open Z-stack Folder"
+        )
+        self.open_button.clicked.connect(
+            self.open_folder
+        )
+        main_layout.addWidget(self.open_button)
+
+        self.stack_info = QLabel(
+            "Z-stack not loaded"
+        )
+        self.stack_info.setWordWrap(True)
+        main_layout.addWidget(self.stack_info)
+
+        self.load_progress_label = QLabel(
+            "Load progress: idle"
+        )
+        self.load_progress_label.setWordWrap(True)
+        main_layout.addWidget(
+            self.load_progress_label
+        )
+
+        self.load_progress = QProgressBar()
+        self.load_progress.setMinimum(0)
+        self.load_progress.setMaximum(100)
+        self.load_progress.setValue(0)
+        self.load_progress.setTextVisible(True)
+        main_layout.addWidget(
+            self.load_progress
+        )
+
+        # ==================================================
+        # 2. Analysis mode
+        # ==================================================
+        step2 = QLabel("2. Analysis method")
+        step2.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(step2)
+
+        self.mode_box = QComboBox()
+        self.mode_box.addItems(
+            [
+                "Standardized Auto (recommended)",
+                "Advanced Manual Threshold",
+            ]
+        )
+        self.mode_box.currentIndexChanged.connect(
+            self.update_mode_ui
+        )
+        main_layout.addWidget(self.mode_box)
+
+        self.protocol_info = QLabel(
+            f"{PROTOCOL_NAME} v{PROTOCOL_VERSION}\n"
+            f"Normalization: P{NORM_LOW_PERCENTILE:g}–"
+            f"P{NORM_HIGH_PERCENTILE:g}\n"
+            f"Gaussian sigma: {GAUSSIAN_SIGMA:g}\n"
+            "Threshold: Otsu (automatic)\n"
+            f"3D closing radius: {CLOSING_RADIUS} voxel"
+        )
+        self.protocol_info.setWordWrap(True)
+        self.protocol_info.setStyleSheet(
+            "padding: 6px; border: 1px solid #888;"
+        )
+        main_layout.addWidget(self.protocol_info)
+
+        # ==================================================
+        # Manual threshold (Advanced only)
+        # ==================================================
+        self.manual_group = QGroupBox(
+            "Advanced Manual Threshold"
+        )
+        manual_layout = QVBoxLayout()
+
+        manual_note = QLabel(
+            "Use only for troubleshooting. "
+            "Manual adjustment is recorded in CSV."
+        )
+        manual_note.setWordWrap(True)
+        manual_layout.addWidget(manual_note)
+
+        threshold_row = QHBoxLayout()
+
+        self.threshold_slider = QSlider(
+            Qt.Horizontal
+        )
+        self.threshold_slider.setMinimum(0)
+        self.threshold_slider.setMaximum(1000)
+        self.threshold_slider.setValue(300)
+
+        self.threshold_box = QSpinBox()
+        self.threshold_box.setMinimum(0)
+        self.threshold_box.setMaximum(1000)
+        self.threshold_box.setValue(300)
+        self.threshold_box.setFixedWidth(80)
+
+        threshold_row.addWidget(
+            self.threshold_slider
+        )
+        threshold_row.addWidget(
+            self.threshold_box
+        )
+        manual_layout.addLayout(
+            threshold_row
+        )
+
+        manual_units = QLabel(
+            "Manual threshold is on normalized intensity: "
+            "0–1000 = 0.000–1.000"
+        )
+        manual_units.setWordWrap(True)
+        manual_layout.addWidget(manual_units)
+
+        self.threshold_slider.valueChanged.connect(
+            self.threshold_box.setValue
+        )
+        self.threshold_box.valueChanged.connect(
+            self.threshold_slider.setValue
+        )
+        self.threshold_slider.valueChanged.connect(
+            self.update_threshold_preview
+        )
+
+        self.manual_group.setLayout(
+            manual_layout
+        )
+        main_layout.addWidget(
+            self.manual_group
+        )
+
+        # ==================================================
+        # Minimum object size
+        # ==================================================
+        min_size_title = QLabel(
+            "Minimum object size (voxels)"
+        )
+        min_size_title.setStyleSheet(
+            "font-weight: bold; margin-top: 10px;"
+        )
+        main_layout.addWidget(min_size_title)
+
+        self.min_size_box = QSpinBox()
+        self.min_size_box.setMinimum(1)
+        self.min_size_box.setMaximum(10000000)
+        self.min_size_box.setValue(500)
+        main_layout.addWidget(
+            self.min_size_box
+        )
+
+        min_note = QLabel(
+            "For comparison experiments, decide this value "
+            "before the main analysis and keep it unchanged "
+            "for all samples."
+        )
+        min_note.setWordWrap(True)
+        main_layout.addWidget(min_note)
+
+        # ==================================================
+        # 3. Detect nuclei
+        # ==================================================
+        step3 = QLabel("3. Detect nuclei")
+        step3.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(step3)
+
+        self.detect_button = QPushButton(
+            "Run Standardized 3D Detection"
+        )
+        self.detect_button.clicked.connect(
+            self.detect_nuclei
+        )
+        main_layout.addWidget(
+            self.detect_button
+        )
+
+        # ==================================================
+        # 4. Voxel calibration
+        # ==================================================
+        step4 = QLabel("4. Voxel Calibration")
+        step4.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(step4)
+
+        xy_row = QHBoxLayout()
+        xy_label = QLabel(
+            "XY pixel size (µm)"
+        )
+
+        self.xy_box = QDoubleSpinBox()
+        self.xy_box.setDecimals(6)
+        self.xy_box.setMinimum(0.000001)
+        self.xy_box.setMaximum(1000.0)
+        self.xy_box.setValue(0.200000)
+
+        xy_row.addWidget(xy_label)
+        xy_row.addWidget(self.xy_box)
+        main_layout.addLayout(xy_row)
+
+        z_row = QHBoxLayout()
+        z_label = QLabel(
+            "Z spacing (µm)"
+        )
+
+        self.z_box = QDoubleSpinBox()
+        self.z_box.setDecimals(6)
+        self.z_box.setMinimum(0.000001)
+        self.z_box.setMaximum(1000.0)
+        self.z_box.setValue(0.500000)
+
+        z_row.addWidget(z_label)
+        z_row.addWidget(self.z_box)
+        main_layout.addLayout(z_row)
+
+        # ==================================================
+        # 5. Calculate volume
+        # ==================================================
+        step5 = QLabel("5. Calculate Volume")
+        step5.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(step5)
+
+        self.volume_button = QPushButton(
+            "Calculate Volume"
+        )
+        self.volume_button.clicked.connect(
+            self.calculate_volume
+        )
+        main_layout.addWidget(
+            self.volume_button
+        )
+
+        # ==================================================
+        # 6. Export CSV
+        # ==================================================
+        step6 = QLabel("6. Export Results")
+        step6.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(step6)
+
+        self.csv_button = QPushButton(
+            "Export CSV"
+        )
+        self.csv_button.clicked.connect(
+            self.export_csv
+        )
+        main_layout.addWidget(
+            self.csv_button
+        )
+
+        self.analysis_progress_label = QLabel(
+            "Analysis progress: idle"
+        )
+        self.analysis_progress_label.setWordWrap(True)
+        main_layout.addWidget(
+            self.analysis_progress_label
+        )
+
+        self.analysis_progress = QProgressBar()
+        self.analysis_progress.setMinimum(0)
+        self.analysis_progress.setMaximum(100)
+        self.analysis_progress.setValue(0)
+        self.analysis_progress.setTextVisible(True)
+        main_layout.addWidget(
+            self.analysis_progress
+        )
+
+        # ==================================================
+        # Mask information
+        # ==================================================
+        self.mask_info = QLabel(
+            "Mask not created"
+        )
+        self.mask_info.setWordWrap(True)
+        main_layout.addWidget(
+            self.mask_info
+        )
+
+        # ==================================================
+        # Nuclei information
+        # ==================================================
+        self.nuclei_info = QLabel(
+            "3D nuclei not detected"
+        )
+        self.nuclei_info.setWordWrap(True)
+        main_layout.addWidget(
+            self.nuclei_info
+        )
+
+        # ==================================================
+        # Nucleus number / 3D review
+        # ==================================================
+        review_title = QLabel(
+            "Nucleus Review / 3D"
+        )
+        review_title.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(review_title)
+
+        review_note = QLabel(
+            "Numbers shown on the image are identical to the CSV 'label' column."
+        )
+        review_note.setWordWrap(True)
+        main_layout.addWidget(review_note)
+
+        nucleus_row = QHBoxLayout()
+        nucleus_row.addWidget(QLabel("Nucleus label"))
+        self.nucleus_select_box = QSpinBox()
+        self.nucleus_select_box.setMinimum(1)
+        self.nucleus_select_box.setMaximum(1)
+        self.nucleus_select_box.setValue(1)
+        nucleus_row.addWidget(self.nucleus_select_box)
+        main_layout.addLayout(nucleus_row)
+
+        self.show_numbers_button = QPushButton(
+            "Show / Refresh Nucleus Numbers"
+        )
+        self.show_numbers_button.clicked.connect(
+            self.show_nucleus_numbers
+        )
+        main_layout.addWidget(
+            self.show_numbers_button
+        )
+
+        view3d_row = QHBoxLayout()
+
+        self.show_selected_3d_button = QPushButton(
+            "Show Selected Nucleus in 3D"
+        )
+        self.show_selected_3d_button.clicked.connect(
+            self.show_selected_nucleus_3d
+        )
+        view3d_row.addWidget(
+            self.show_selected_3d_button
+        )
+
+        self.back_2d_button = QPushButton(
+            "Back to 2D"
+        )
+        self.back_2d_button.clicked.connect(
+            self.back_to_2d
+        )
+        view3d_row.addWidget(
+            self.back_2d_button
+        )
+
+        main_layout.addLayout(view3d_row)
+
+        # ==================================================
+        # Results
+        # ==================================================
+        result_title = QLabel(
+            "Volume Results"
+        )
+        result_title.setStyleSheet(
+            "font-weight: bold; margin-top: 12px;"
+        )
+        main_layout.addWidget(
+            result_title
+        )
+
+        self.result_summary = QLabel(
+            "No volume results."
+        )
+        self.result_summary.setWordWrap(True)
+        self.result_summary.setStyleSheet(
+            "font-weight: bold; padding: 6px; border: 1px solid #888;"
+        )
+        main_layout.addWidget(
+            self.result_summary
+        )
+
+        self.result_table = QTableWidget()
+        self.result_table.setColumnCount(6)
+        self.result_table.setHorizontalHeaderLabels(
+            [
+                "Label",
+                "Volume (µm³)",
+                "Voxels",
+                "Z start",
+                "Z end",
+                "Z slices",
+            ]
+        )
+        self.result_table.setMinimumHeight(220)
+        self.result_table.setEditTriggers(
+            QAbstractItemView.NoEditTriggers
+        )
+        self.result_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        main_layout.addWidget(
+            self.result_table
+        )
+
+        self.result_text = QPlainTextEdit()
+        self.result_text.setReadOnly(True)
+        self.result_text.setMinimumHeight(110)
+        self.result_text.setPlainText(
+            "Detailed analysis information will appear here."
+        )
+        main_layout.addWidget(
+            self.result_text
+        )
+
+        # ==================================================
+        # Status
+        # ==================================================
+        self.status = QLabel("Ready")
+        self.status.setWordWrap(True)
+        main_layout.addWidget(
+            self.status
+        )
+
+        main_layout.addStretch()
+
+        self.scroll_area.setWidget(
+            scroll_content
+        )
+        outer_layout.addWidget(
+            self.scroll_area
+        )
+        self.setLayout(
+            outer_layout
+        )
+
+        self.update_mode_ui()
+
+    # ======================================================
+    # UI stability helpers
+    # ======================================================
+    def begin_busy(self, message=None):
+        """Lock analysis controls during a long operation.
+
+        This is intentionally UI-only: it does not change the image,
+        segmentation parameters, thresholding, labeling, or volume math.
+        """
+        if self._busy:
+            return False
+
+        self._busy = True
+        self._busy_mode_index = int(self.mode_box.currentIndex())
+
+        widgets = [
+            self.mode_box,
+            self.open_button,
+            self.detect_button,
+            self.volume_button,
+            self.csv_button,
+            self.min_size_box,
+            self.xy_box,
+            self.z_box,
+            self.threshold_slider,
+            self.threshold_box,
+            self.nucleus_select_box,
+            self.show_numbers_button,
+            self.show_selected_3d_button,
+            self.back_2d_button,
+        ]
+
+        for widget in widgets:
+            widget.setEnabled(False)
+
+        if message:
+            self.status.setText(str(message))
+
+        # Apply the disabled state before the heavy work starts so that
+        # accidental clicks are not queued while Windows is busy.
+        QApplication.processEvents()
+        return True
+
+    def end_busy(self):
+        """Restore the UI and the mode that was active at start."""
+        saved_index = self._busy_mode_index
+
+        if saved_index is not None:
+            blocker = QSignalBlocker(self.mode_box)
+            self.mode_box.setCurrentIndex(int(saved_index))
+            del blocker
+
+        widgets = [
+            self.mode_box,
+            self.open_button,
+            self.detect_button,
+            self.volume_button,
+            self.csv_button,
+            self.min_size_box,
+            self.xy_box,
+            self.z_box,
+            self.nucleus_select_box,
+            self.show_numbers_button,
+            self.show_selected_3d_button,
+            self.back_2d_button,
+        ]
+
+        for widget in widgets:
+            widget.setEnabled(True)
+
+        auto = self.is_auto_mode()
+        self.manual_group.setVisible(not auto)
+        self.threshold_slider.setEnabled(not auto)
+        self.threshold_box.setEnabled(not auto)
+
+        if auto:
+            self.detect_button.setText(
+                "Run Standardized 3D Detection"
+            )
+        else:
+            self.detect_button.setText(
+                "Run Manual 3D Detection"
+            )
+
+        self._busy = False
+        self._busy_mode_index = None
+        QApplication.processEvents()
+
+    # ======================================================
+    # Progress helpers
+    # ======================================================
+    def set_load_progress(self, value, message):
+        self.load_progress.setValue(
+            int(max(0, min(100, value)))
+        )
+        self.load_progress_label.setText(
+            str(message)
+        )
+        QApplication.processEvents()
+
+    def set_analysis_progress(self, value, message):
+        self.analysis_progress.setValue(
+            int(max(0, min(100, value)))
+        )
+        self.analysis_progress_label.setText(
+            str(message)
+        )
+        QApplication.processEvents()
+
+    # ======================================================
+    # Mode helpers
+    # ======================================================
+    def is_auto_mode(self):
+        return self.mode_box.currentIndex() == 0
+
+    def update_mode_ui(self):
+        auto = self.is_auto_mode()
+        self.manual_group.setVisible(not auto)
+
+        if auto:
+            self.detect_button.setText(
+                "Run Standardized 3D Detection"
+            )
+        else:
+            self.detect_button.setText(
+                "Run Manual 3D Detection"
+            )
+
+        if self.stack is not None:
+            if auto:
+                self.update_auto_preview()
+            else:
+                self.update_threshold_preview(
+                    self.threshold_slider.value()
+                )
+
+    # ======================================================
+    # Open folder
+    # ======================================================
+    def open_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Z-stack folder"
+        )
+
+        if not folder:
+            return
+
+        self.begin_busy("Loading Z-stack...")
+
+        self.folder_label.setText(folder)
+        self.status.setText(
+            "Searching TIFF files..."
+        )
+        self.set_load_progress(
+            0,
+            "Searching TIFF files..."
+        )
+
+        try:
+            all_tiff_files = []
+
+            for filename in os.listdir(folder):
+                lower = filename.lower()
+
+                if (
+                    lower.endswith(".tif")
+                    or lower.endswith(".tiff")
+                ):
+                    all_tiff_files.append(
+                        os.path.join(
+                            folder,
+                            filename
+                        )
+                    )
+
+            if len(all_tiff_files) == 0:
+                self.status.setText(
+                    "No .tif or .tiff files were found."
+                )
+                return
+
+            z_files = []
+
+            for path in all_tiff_files:
+                filename = os.path.basename(path)
+
+                match = re.search(
+                    r"z(\d+)",
+                    filename,
+                    re.IGNORECASE
+                )
+
+                if match:
+                    z_number = int(
+                        match.group(1)
+                    )
+
+                    z_files.append(
+                        (
+                            z_number,
+                            path
+                        )
+                    )
+
+            # Fallback: natural filename order if z### is absent.
+            if len(z_files) == 0:
+                sorted_paths = sorted(
+                    all_tiff_files,
+                    key=lambda p: natural_key(
+                        os.path.basename(p)
+                    )
+                )
+                z_files = [
+                    (i + 1, p)
+                    for i, p in enumerate(
+                        sorted_paths
+                    )
+                ]
+
+            z_files.sort(
+                key=lambda x: x[0]
+            )
+
+            z_numbers = [
+                z for z, path in z_files
+            ]
+
+            duplicates = sorted(
+                {
+                    z
+                    for z in z_numbers
+                    if z_numbers.count(z) > 1
+                }
+            )
+
+            if duplicates:
+                self.status.setText(
+                    "Duplicate Z numbers found:\n"
+                    f"{duplicates[:20]}"
+                )
+                return
+
+            images = []
+            target_shape = None
+            total = len(z_files)
+
+            for i, (z_number, path) in enumerate(
+                z_files
+            ):
+                img = tifffile.imread(path)
+
+                # RGB/RGBA -> brightest RGB value.
+                # If your acquisition is genuinely multichannel,
+                # use a single nuclear channel before analysis.
+                if (
+                    img.ndim == 3
+                    and img.shape[-1] in (3, 4)
+                ):
+                    img = np.max(
+                        img[..., :3],
+                        axis=-1
+                    )
+
+                if img.ndim != 2:
+                    raise ValueError(
+                        f"Unsupported image shape: "
+                        f"{img.shape}\n"
+                        f"{os.path.basename(path)}"
+                    )
+
+                if target_shape is None:
+                    target_shape = img.shape
+
+                if img.shape != target_shape:
+                    raise ValueError(
+                        "Image sizes are not identical.\n"
+                        f"Expected: {target_shape}\n"
+                        f"Found: {img.shape}\n"
+                        f"File: {os.path.basename(path)}"
+                    )
+
+                images.append(img)
+
+                progress_value = int(
+                    round(
+                        (i + 1)
+                        / max(total, 1)
+                        * 80
+                    )
+                )
+
+                self.status.setText(
+                    f"Loading {i + 1}/{total}"
+                )
+                self.set_load_progress(
+                    progress_value,
+                    f"Loading Z-stack: "
+                    f"{i + 1}/{total} slices"
+                )
+
+            self.stack = np.stack(
+                images,
+                axis=0
+            )
+
+            self.set_load_progress(
+                85,
+                "Combining slices into 3D stack..."
+            )
+
+            self.set_load_progress(
+                90,
+                "Standardizing fluorescence intensity..."
+            )
+            self.prepare_standardized_stack()
+
+            self.set_load_progress(
+                96,
+                "Preparing napari display..."
+            )
+
+            # Reset old analysis
+            self.labels = None
+            self.results_df = None
+
+            self.result_text.setPlainText(
+                "Detailed analysis information will appear here."
+            )
+            self.result_summary.setText(
+                "No volume results."
+            )
+            self.result_table.setRowCount(0)
+
+            # Remove old layers
+            for layer in [
+                self.selected_nucleus_layer,
+                self.number_layer,
+                self.nuclei_layer,
+                self.mask_layer,
+                self.image_layer,
+            ]:
+                if (
+                    layer is not None
+                    and layer in self.viewer.layers
+                ):
+                    self.viewer.layers.remove(
+                        layer
+                    )
+
+            self.selected_nucleus_layer = None
+            self.number_layer = None
+            self.nuclei_layer = None
+            self.mask_layer = None
+            self.image_layer = None
+
+            stack_min = float(
+                np.min(self.stack)
+            )
+            stack_max = float(
+                np.max(self.stack)
+            )
+
+            p_low = self.norm_low_value
+            p_high = self.norm_high_value
+
+            if p_high <= p_low:
+                p_low = stack_min
+                p_high = stack_max
+
+            if p_high <= p_low:
+                p_low = 0.0
+                p_high = 1.0
+
+            self.image_layer = (
+                self.viewer.add_image(
+                    self.stack,
+                    name="Original Z-stack",
+                    colormap="gray",
+                    contrast_limits=(
+                        p_low,
+                        p_high
+                    ),
+                )
+            )
+
+            first_z = z_files[0][0]
+            last_z = z_files[-1][0]
+
+            self.stack_info.setText(
+                f"Z slices: {self.stack.shape[0]}\n"
+                f"Z range: {first_z} - {last_z}\n"
+                f"Stack shape: {self.stack.shape}\n"
+                f"Raw intensity: "
+                f"{stack_min:.0f} - {stack_max:.0f}\n"
+                f"P{NORM_LOW_PERCENTILE:g}: "
+                f"{self.norm_low_value:.3f}\n"
+                f"P{NORM_HIGH_PERCENTILE:g}: "
+                f"{self.norm_high_value:.3f}"
+            )
+
+            self.update_mode_ui()
+
+            self.set_load_progress(
+                100,
+                f"Loaded successfully: "
+                f"{self.stack.shape[0]} slices"
+            )
+            self.status.setText(
+                "Z-stack loaded successfully."
+            )
+
+        except Exception as e:
+            self.set_load_progress(
+                0,
+                "Load failed."
+            )
+            self.status.setText(
+                "ERROR:\n"
+                f"{type(e).__name__}: {e}"
+            )
+        finally:
+            self.end_busy()
+
+    # ======================================================
+    # Standardized preprocessing
+    # ======================================================
+    def prepare_standardized_stack(self):
+        if self.stack is None:
+            return
+
+        x = np.asarray(
+            self.stack,
+            dtype=np.float32
+        )
+
+        self.norm_low_value = float(
+            np.percentile(
+                x,
+                NORM_LOW_PERCENTILE
+            )
+        )
+
+        self.norm_high_value = float(
+            np.percentile(
+                x,
+                NORM_HIGH_PERCENTILE
+            )
+        )
+
+        if (
+            not np.isfinite(self.norm_low_value)
+            or not np.isfinite(self.norm_high_value)
+            or self.norm_high_value
+            <= self.norm_low_value
+        ):
+            self.norm_low_value = float(
+                np.min(x)
+            )
+            self.norm_high_value = float(
+                np.max(x)
+            )
+
+        if (
+            self.norm_high_value
+            <= self.norm_low_value
+        ):
+            self.norm_high_value = (
+                self.norm_low_value + 1.0
+            )
+
+        # Robust 0-1 normalization.
+        normalized = (
+            x - self.norm_low_value
+        ) / (
+            self.norm_high_value
+            - self.norm_low_value
+        )
+
+        normalized = np.clip(
+            normalized,
+            0.0,
+            1.0
+        ).astype(
+            np.float32,
+            copy=False
+        )
+
+        self.normalized_stack = normalized
+
+        # Fixed 3D Gaussian smoothing.
+        self.smoothed_stack = filters.gaussian(
+            normalized,
+            sigma=GAUSSIAN_SIGMA,
+            preserve_range=True
+        ).astype(
+            np.float32,
+            copy=False
+        )
+
+        # Otsu threshold is calculated after exactly
+        # the same normalization and smoothing rule.
+        finite_values = self.smoothed_stack[
+            np.isfinite(self.smoothed_stack)
+        ]
+
+        if finite_values.size == 0:
+            raise ValueError(
+                "No finite intensity values."
+            )
+
+        self.auto_threshold_norm = float(
+            filters.threshold_otsu(
+                finite_values
+            )
+        )
+
+        self.auto_threshold_raw_equiv = float(
+            self.norm_low_value
+            + self.auto_threshold_norm
+            * (
+                self.norm_high_value
+                - self.norm_low_value
+            )
+        )
+
+        # The lower percentile is a robust estimate
+        # of the dark/background intensity level.
+        self.background_value = float(
+            self.norm_low_value
+        )
+
+    # ======================================================
+    # Mask creation
+    # ======================================================
+    def build_mask(self):
+        if self.stack is None:
+            raise ValueError(
+                "Load a Z-stack first."
+            )
+
+        if self.smoothed_stack is None:
+            self.prepare_standardized_stack()
+
+        if self.is_auto_mode():
+            threshold = float(
+                self.auto_threshold_norm
+            )
+            mode = (
+                "Standardized Auto"
+            )
+        else:
+            threshold = (
+                self.threshold_slider.value()
+                / 1000.0
+            )
+            mode = (
+                "Advanced Manual Threshold"
+            )
+
+        mask = (
+            self.smoothed_stack
+            > threshold
+        )
+
+        min_size = int(
+            self.min_size_box.value()
+        )
+
+        # Remove small components.
+        clean = morphology.remove_small_objects(
+            mask,
+            min_size=min_size
+        )
+
+        # Mild fixed 3D closing.
+        clean = morphology.binary_closing(
+            clean,
+            morphology.ball(
+                CLOSING_RADIUS
+            )
+        )
+
+        # Fill internal holes in 3D.
+        clean = ndi.binary_fill_holes(
+            clean
+        )
+
+        # Closing/filling can leave tiny islands;
+        # enforce the same minimum size again.
+        clean = morphology.remove_small_objects(
+            clean,
+            min_size=min_size
+        )
+
+        return (
+            clean.astype(bool),
+            threshold,
+            mode
+        )
+
+    # ======================================================
+    # Preview helpers
+    # ======================================================
+    def show_mask_preview(
+        self,
+        mask,
+        threshold,
+        mode
+    ):
+        positive_voxels = int(
+            np.count_nonzero(mask)
+        )
+
+        percentage = (
+            positive_voxels
+            / mask.size
+            * 100.0
+        )
+
+        mask_uint8 = mask.astype(
+            np.uint8
+        )
+
+        if (
+            self.mask_layer is None
+            or self.mask_layer
+            not in self.viewer.layers
+        ):
+            self.mask_layer = (
+                self.viewer.add_labels(
+                    mask_uint8,
+                    name="Segmentation preview",
+                    opacity=0.35,
+                )
+            )
+        else:
+            self.mask_layer.data = (
+                mask_uint8
+            )
+            self.mask_layer.refresh()
+
+        if mode == "Standardized Auto":
+            raw_equiv = (
+                self.auto_threshold_raw_equiv
+            )
+            threshold_text = (
+                f"Auto threshold "
+                f"(normalized): "
+                f"{threshold:.4f}\n"
+                f"Approx. raw-equivalent: "
+                f"{raw_equiv:.3f}"
+            )
+        else:
+            raw_equiv = (
+                self.norm_low_value
+                + threshold
+                * (
+                    self.norm_high_value
+                    - self.norm_low_value
+                )
+            )
+            threshold_text = (
+                f"Manual threshold "
+                f"(normalized): "
+                f"{threshold:.4f}\n"
+                f"Approx. raw-equivalent: "
+                f"{raw_equiv:.3f}"
+            )
+
+        self.mask_info.setText(
+            f"Mode: {mode}\n"
+            f"{threshold_text}\n"
+            f"Positive voxels: "
+            f"{positive_voxels:,}\n"
+            f"Fraction: "
+            f"{percentage:.3f}%"
+        )
+
+    def update_auto_preview(self):
+        if self.stack is None:
+            return
+
+        try:
+            mask, threshold, mode = (
+                self.build_mask()
+            )
+            self.show_mask_preview(
+                mask,
+                threshold,
+                mode
+            )
+        except Exception as e:
+            self.status.setText(
+                "Auto preview error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+
+    def update_threshold_preview(
+        self,
+        value=None
+    ):
+        if (
+            self.stack is None
+            or self.is_auto_mode()
+        ):
+            return
+
+        try:
+            mask, threshold, mode = (
+                self.build_mask()
+            )
+            self.show_mask_preview(
+                mask,
+                threshold,
+                mode
+            )
+        except Exception as e:
+            self.status.setText(
+                "Threshold preview error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ======================================================
+    # Detect 3D nuclei
+    # ======================================================
+    def detect_nuclei(self):
+        if self.stack is None:
+            self.status.setText(
+                "Load a Z-stack first."
+            )
+            return
+
+        self.begin_busy("Detecting 3D nuclei...")
+
+        try:
+            self.status.setText(
+                "Detecting 3D nuclei..."
+            )
+            self.set_analysis_progress(
+                5,
+                "Preparing standardized image..."
+            )
+
+            self.set_analysis_progress(
+                20,
+                "Creating threshold mask..."
+            )
+            clean, threshold, mode = (
+                self.build_mask()
+            )
+
+            self.set_analysis_progress(
+                65,
+                "Labeling connected 3D nuclei..."
+            )
+            labels = measure.label(
+                clean,
+                connectivity=CONNECTIVITY
+            )
+
+            self.set_analysis_progress(
+                85,
+                "Updating napari layers..."
+            )
+
+            self.labels = labels
+            self.analysis_mode_used = mode
+
+            number_of_objects = int(
+                labels.max()
+            )
+
+            if (
+                self.nuclei_layer is None
+                or self.nuclei_layer
+                not in self.viewer.layers
+            ):
+                self.nuclei_layer = (
+                    self.viewer.add_labels(
+                        labels,
+                        name="3D nuclei",
+                        opacity=0.55,
+                    )
+                )
+            else:
+                self.nuclei_layer.data = (
+                    labels
+                )
+                self.nuclei_layer.refresh()
+
+            if self.mask_layer is not None:
+                self.mask_layer.visible = False
+
+            self.nucleus_select_box.setMaximum(
+                max(1, number_of_objects)
+            )
+            self.nucleus_select_box.setValue(1)
+            self.show_nucleus_numbers()
+
+            min_size = int(
+                self.min_size_box.value()
+            )
+
+            if mode == "Standardized Auto":
+                threshold_line = (
+                    f"Auto Otsu threshold: "
+                    f"{threshold:.4f}"
+                )
+            else:
+                threshold_line = (
+                    f"Manual threshold: "
+                    f"{threshold:.4f}"
+                )
+
+            self.nuclei_info.setText(
+                f"Detected 3D objects: "
+                f"{number_of_objects}\n"
+                f"Mode: {mode}\n"
+                f"{threshold_line}\n"
+                f"Minimum size: "
+                f"{min_size:,} voxels"
+            )
+
+            self.results_df = None
+            self.result_text.setPlainText(
+                "3D nuclei detected.\n"
+                "Press Calculate Volume."
+            )
+
+            self.set_analysis_progress(
+                100,
+                f"3D detection completed: "
+                f"{number_of_objects} objects"
+            )
+            self.status.setText(
+                "3D detection completed."
+            )
+
+        except Exception as e:
+            self.set_analysis_progress(
+                0,
+                "3D detection failed."
+            )
+            self.status.setText(
+                "3D detection error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+        finally:
+            self.end_busy()
+
+    # ======================================================
+    # Show nucleus numbers on each Z slice
+    # ======================================================
+    def show_nucleus_numbers(self):
+        if self.labels is None:
+            self.status.setText(
+                "Run 3D Detection first."
+            )
+            return
+
+        try:
+            points = []
+            label_values = []
+
+            max_label = int(self.labels.max())
+
+            # Place one number for each object on every Z slice
+            # where that object is present. This makes the CSV label
+            # easy to identify while scrolling through Z.
+            for label_id in range(1, max_label + 1):
+                object_mask = self.labels == label_id
+                z_indices = np.where(
+                    np.any(object_mask, axis=(1, 2))
+                )[0]
+
+                for z in z_indices:
+                    yy, xx = np.nonzero(object_mask[z])
+                    if yy.size == 0:
+                        continue
+                    points.append(
+                        [
+                            float(z),
+                            float(np.mean(yy)),
+                            float(np.mean(xx)),
+                        ]
+                    )
+                    label_values.append(
+                        int(label_id)
+                    )
+
+            if self.number_layer is not None and self.number_layer in self.viewer.layers:
+                self.viewer.layers.remove(
+                    self.number_layer
+                )
+                self.number_layer = None
+
+            if not points:
+                self.status.setText(
+                    "No nuclei available for numbering."
+                )
+                return
+
+            points = np.asarray(points, dtype=float)
+            features = {
+                "label": np.asarray(label_values, dtype=int)
+            }
+            text = {
+                "string": "{label}",
+                "size": 14,
+                "color": "yellow",
+            }
+
+            self.number_layer = self.viewer.add_points(
+                points,
+                features=features,
+                text=text,
+                size=2,
+                name="Nucleus numbers (CSV label)",
+                opacity=1.0,
+            )
+
+            self.status.setText(
+                "Nucleus numbers displayed. "
+                "They match the CSV label column."
+            )
+
+        except Exception as e:
+            self.status.setText(
+                "Number display error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ======================================================
+    # Show selected nucleus in physically scaled 3D
+    # ======================================================
+    def show_selected_nucleus_3d(self):
+        if self.labels is None:
+            self.status.setText(
+                "Run 3D Detection first."
+            )
+            return
+
+        try:
+            label_id = int(
+                self.nucleus_select_box.value()
+            )
+
+            selected = (
+                self.labels == label_id
+            ).astype(np.uint8)
+
+            if not np.any(selected):
+                self.status.setText(
+                    f"Nucleus {label_id} was not found."
+                )
+                return
+
+            if (
+                self.selected_nucleus_layer is not None
+                and self.selected_nucleus_layer in self.viewer.layers
+            ):
+                self.viewer.layers.remove(
+                    self.selected_nucleus_layer
+                )
+
+            z_um = float(self.z_box.value())
+            xy_um = float(self.xy_box.value())
+            scale = (z_um, xy_um, xy_um)
+
+            # Apply the same physical scale to all aligned 3D layers.
+            for layer in [
+                self.image_layer,
+                self.mask_layer,
+                self.nuclei_layer,
+                self.number_layer,
+            ]:
+                if layer is not None and layer in self.viewer.layers:
+                    layer.scale = scale
+
+            self.selected_nucleus_layer = self.viewer.add_labels(
+                selected,
+                name=f"Selected nucleus {label_id} - 3D",
+                opacity=0.75,
+                scale=scale,
+            )
+
+            if self.nuclei_layer is not None:
+                self.nuclei_layer.visible = False
+            if self.mask_layer is not None:
+                self.mask_layer.visible = False
+            if self.number_layer is not None:
+                self.number_layer.visible = False
+
+            self.viewer.dims.ndisplay = 3
+
+            self.status.setText(
+                f"Showing nucleus {label_id} in 3D. "
+                f"Scale: XY={xy_um:.6f} µm, Z={z_um:.6f} µm."
+            )
+
+        except Exception as e:
+            self.status.setText(
+                "3D display error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ======================================================
+    # Return to normal 2D review
+    # ======================================================
+    def back_to_2d(self):
+        try:
+            self.viewer.dims.ndisplay = 2
+
+            if (
+                self.selected_nucleus_layer is not None
+                and self.selected_nucleus_layer in self.viewer.layers
+            ):
+                self.selected_nucleus_layer.visible = False
+
+            if self.nuclei_layer is not None:
+                self.nuclei_layer.visible = True
+            if self.number_layer is not None:
+                self.number_layer.visible = True
+
+            self.status.setText(
+                "Returned to 2D review."
+            )
+        except Exception as e:
+            self.status.setText(
+                "2D display error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+
+    # ======================================================
+    # Calculate volume
+    # ======================================================
+    def calculate_volume(self):
+        if self.labels is None:
+            self.status.setText(
+                "Run 3D Detection first."
+            )
+            return
+
+        self.begin_busy("Calculating volume...")
+
+        try:
+            self.set_analysis_progress(
+                10,
+                "Reading voxel calibration..."
+            )
+
+            xy_um = float(
+                self.xy_box.value()
+            )
+
+            z_um = float(
+                self.z_box.value()
+            )
+
+            voxel_volume = (
+                xy_um
+                * xy_um
+                * z_um
+            )
+
+            self.set_analysis_progress(
+                35,
+                "Measuring 3D objects..."
+            )
+
+            props = measure.regionprops_table(
+                self.labels,
+                properties=(
+                    "label",
+                    "area",
+                    "bbox",
+                )
+            )
+
+            df = pd.DataFrame(
+                props
+            )
+
+            if len(df) == 0:
+                self.status.setText(
+                    "No 3D objects were found."
+                )
+                self.result_text.setPlainText(
+                    "No volume results."
+                )
+                return
+
+            # In a 3D label image, area = voxel count.
+            df = df.rename(
+                columns={
+                    "area": "voxels"
+                }
+            )
+
+            df["voxels"] = (
+                df["voxels"].astype(
+                    np.int64
+                )
+            )
+
+            df["volume_um3"] = (
+                df["voxels"]
+                * voxel_volume
+            )
+
+            df["z_start_index"] = (
+                df["bbox-0"].astype(int)
+            )
+
+            df["z_end_index"] = (
+                df["bbox-3"].astype(int)
+                - 1
+            )
+
+            df["z_slices"] = (
+                df["bbox-3"]
+                - df["bbox-0"]
+            ).astype(int)
+
+            bbox_columns = [
+                column
+                for column in df.columns
+                if column.startswith(
+                    "bbox-"
+                )
+            ]
+
+            df = df.drop(
+                columns=bbox_columns
+            )
+
+            mode = (
+                self.analysis_mode_used
+                if self.analysis_mode_used
+                is not None
+                else (
+                    "Standardized Auto"
+                    if self.is_auto_mode()
+                    else
+                    "Advanced Manual Threshold"
+                )
+            )
+
+            if mode == "Standardized Auto":
+                threshold_norm = float(
+                    self.auto_threshold_norm
+                )
+            else:
+                threshold_norm = (
+                    self.threshold_slider.value()
+                    / 1000.0
+                )
+
+            threshold_raw_equiv = float(
+                self.norm_low_value
+                + threshold_norm
+                * (
+                    self.norm_high_value
+                    - self.norm_low_value
+                )
+            )
+
+            # ==================================================
+            # Record the full analysis conditions in every row.
+            # This allows later verification that the same
+            # protocol was used for all samples.
+            # ==================================================
+            df["analysis_mode"] = mode
+            df["manual_adjustment"] = (
+                "No"
+                if mode == "Standardized Auto"
+                else "Yes"
+            )
+            df["protocol_name"] = (
+                PROTOCOL_NAME
+            )
+            df["protocol_version"] = (
+                PROTOCOL_VERSION
+            )
+            df["normalization_low_percentile"] = (
+                NORM_LOW_PERCENTILE
+            )
+            df["normalization_high_percentile"] = (
+                NORM_HIGH_PERCENTILE
+            )
+            df["normalization_low_raw"] = (
+                self.norm_low_value
+            )
+            df["normalization_high_raw"] = (
+                self.norm_high_value
+            )
+            df["background_estimate_raw"] = (
+                self.background_value
+            )
+            df["threshold_method"] = (
+                "Otsu"
+                if mode == "Standardized Auto"
+                else "Manual"
+            )
+            df["threshold_normalized"] = (
+                threshold_norm
+            )
+            df["threshold_raw_equivalent"] = (
+                threshold_raw_equiv
+            )
+            df["gaussian_sigma"] = (
+                GAUSSIAN_SIGMA
+            )
+            df["minimum_object_size_voxels"] = (
+                int(
+                    self.min_size_box.value()
+                )
+            )
+            df["closing_radius_voxels"] = (
+                CLOSING_RADIUS
+            )
+            df["connectivity"] = (
+                CONNECTIVITY
+            )
+            df["xy_pixel_size_um"] = (
+                xy_um
+            )
+            df["z_spacing_um"] = (
+                z_um
+            )
+            df["voxel_volume_um3"] = (
+                voxel_volume
+            )
+
+            preferred_columns = [
+                "label",
+                "voxels",
+                "volume_um3",
+                "z_start_index",
+                "z_end_index",
+                "z_slices",
+                "analysis_mode",
+                "manual_adjustment",
+                "protocol_name",
+                "protocol_version",
+                "threshold_method",
+                "threshold_normalized",
+                "threshold_raw_equivalent",
+                "normalization_low_percentile",
+                "normalization_high_percentile",
+                "normalization_low_raw",
+                "normalization_high_raw",
+                "background_estimate_raw",
+                "gaussian_sigma",
+                "minimum_object_size_voxels",
+                "closing_radius_voxels",
+                "connectivity",
+                "xy_pixel_size_um",
+                "z_spacing_um",
+                "voxel_volume_um3",
+            ]
+
+            df = df[
+                preferred_columns
+            ]
+
+            df = df.sort_values(
+                "label"
+            ).reset_index(
+                drop=True
+            )
+
+            self.results_df = df
+
+            # ==================================================
+            # Show compact results immediately in the napari UI
+            # ==================================================
+            mean_volume = float(df["volume_um3"].mean())
+            median_volume = float(df["volume_um3"].median())
+            self.result_summary.setText(
+                f"Calculated nuclei: {len(df)} | "
+                f"Mean volume: {mean_volume:.3f} µm³ | "
+                f"Median: {median_volume:.3f} µm³"
+            )
+
+            self.result_table.setRowCount(len(df))
+            table_columns = [
+                "label",
+                "volume_um3",
+                "voxels",
+                "z_start_index",
+                "z_end_index",
+                "z_slices",
+            ]
+
+            for table_row, (_, row) in enumerate(df.iterrows()):
+                values = [
+                    str(int(row["label"])),
+                    f'{float(row["volume_um3"]):.3f}',
+                    f'{int(row["voxels"]):,}',
+                    str(int(row["z_start_index"])),
+                    str(int(row["z_end_index"])),
+                    str(int(row["z_slices"])),
+                ]
+                for table_col, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    self.result_table.setItem(
+                        table_row, table_col, item
+                    )
+
+            self.result_table.resizeColumnsToContents()
+
+            # ==================================================
+            # Show results
+            # ==================================================
+            lines = []
+
+            lines.append(
+                f"Protocol: "
+                f"{PROTOCOL_NAME} "
+                f"v{PROTOCOL_VERSION}"
+            )
+            lines.append(
+                f"Mode: {mode}"
+            )
+            lines.append(
+                f"Threshold method: "
+                f"{'Otsu' if mode == 'Standardized Auto' else 'Manual'}"
+            )
+            lines.append(
+                f"Normalized threshold: "
+                f"{threshold_norm:.4f}"
+            )
+            lines.append(
+                f"Raw-equivalent threshold: "
+                f"{threshold_raw_equiv:.3f}"
+            )
+            lines.append(
+                ""
+            )
+
+            lines.append(
+                "Voxel size:"
+            )
+            lines.append(
+                f"XY = {xy_um:.6f} µm"
+            )
+            lines.append(
+                f"Z  = {z_um:.6f} µm"
+            )
+            lines.append(
+                f"Voxel volume = "
+                f"{voxel_volume:.9f} µm³"
+            )
+            lines.append(
+                ""
+            )
+            lines.append(
+                f"Detected nuclei: "
+                f"{len(df)}"
+            )
+            lines.append(
+                ""
+            )
+
+            max_preview = 100
+
+            for _, row in df.head(
+                max_preview
+            ).iterrows():
+                lines.append(
+                    f"Nucleus "
+                    f"{int(row['label'])}: "
+                    f"{row['volume_um3']:.3f} µm³ "
+                    f"({int(row['voxels']):,} voxels, "
+                    f"Z {int(row['z_start_index'])}"
+                    f"-{int(row['z_end_index'])})"
+                )
+
+            if len(df) > max_preview:
+                lines.append("")
+                lines.append(
+                    f"... and "
+                    f"{len(df) - max_preview} "
+                    f"more objects."
+                )
+
+            self.result_text.setPlainText(
+                "\n".join(lines)
+            )
+
+            self.set_analysis_progress(
+                100,
+                f"Volume calculation completed: "
+                f"{len(df)} nuclei"
+            )
+            self.status.setText(
+                "Volume calculation completed."
+            )
+
+        except Exception as e:
+            self.set_analysis_progress(
+                0,
+                "Volume calculation failed."
+            )
+            self.status.setText(
+                "Volume calculation error:\n"
+                f"{type(e).__name__}: {e}"
+            )
+        finally:
+            self.end_busy()
+
+    # ======================================================
+    # Export CSV
+    # ======================================================
+    def export_csv(self):
+        if (
+            self.results_df is None
+            or len(self.results_df) == 0
+        ):
+            self.status.setText(
+                "Calculate Volume first."
+            )
+            return
+
+        try:
+            path, _ = QFileDialog.getSaveFileName(
+                self,
+                "Save volume results",
+                "nuclear_volume_results.csv",
+                "CSV Files (*.csv)"
+            )
+
+            if not path:
+                return
+
+            if not path.lower().endswith(
+                ".csv"
+            ):
+                path += ".csv"
+
+            self.results_df.to_csv(
+                path,
+                index=False,
+                encoding="utf-8-sig"
+            )
+
+            self.status.setText(
+                f"CSV saved:\n{path}"
+            )
+
+        except Exception as e:
+            self.status.setText(
+                "CSV export error:\n"
+                f"{type(e).__name__}: {e}"
+            )
